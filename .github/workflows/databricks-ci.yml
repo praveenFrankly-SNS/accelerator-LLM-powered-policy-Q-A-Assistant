@@ -1,0 +1,50 @@
+name: Databricks Asset Bundles CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@main
+        env:
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+      - name: Configure Databricks CLI authentication
+        run: |
+          echo "[DEFAULT]"                              > ~/.databrickscfg
+          echo "host  = ${{ secrets.DATABRICKS_HOST }}" >> ~/.databrickscfg
+          echo "token = ${{ secrets.DATABRICKS_TOKEN }}" >> ~/.databrickscfg
+
+      - name: Validate bundle
+        run: databricks bundle validate --var="environment=dev"
+
+      - name: Deploy bundle
+        run: databricks bundle deploy --var="environment=dev"
+
+      - name: Run pipeline workflow
+        run: |
+          echo "🚀 Starting Policy Q&A pipeline..."
+          databricks bundle run policy_qa_workflow --target dev --var="environment=dev"
+          echo "✅ Pipeline completed"
+
+      - name: Cleanup PR deployment
+        if: always()
+        run: databricks bundle destroy --target dev --var="environment=dev" --auto-approve || true

@@ -1,0 +1,32 @@
+# Core NLP / LLM libraries
+sentence-transformers>=2.2.2
+transformers>=4.35.0
+torch>=2.0.0                  # CPU-only build is fine for free tier
+
+# Document parsing (for real PDF ingestion)
+pypdf>=3.17.0
+langchain>=0.1.0
+langchain-community>=0.0.10
+tiktoken>=0.5.1
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+pyspark>=3.4.0
+
+# Visualisation
+plotly>=5.17.0
+matplotlib>=3.6.0
+
+# Utilities
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# MLOps
+mlflow>=2.7.0
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.7.0
+flake8>=6.0.0

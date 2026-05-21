@@ -1,0 +1,92 @@
+bundle:
+  name: llm-powered-policy-qa-assistant
+
+variables:
+  catalog_name:
+    description: "Unity Catalog name for the Policy Q&A Assistant solution"
+    default: "dev_policy_qa"
+
+  schema_name:
+    description: "Schema name within the catalog"
+    default: "policy_assistant"
+
+  environment:
+    description: "Deployment environment (dev, staging, prod)"
+    default: "dev"
+
+  service_principal_name:
+    description: "Service principal for production deployment"
+    default: ""
+
+resources:
+  jobs:
+    policy_qa_workflow:
+      name: "LLM-Powered Policy Q&A Assistant Pipeline"
+      description: "End-to-end RAG pipeline for policy document ingestion, embedding, vector indexing, and Q&A using open-source LLMs on Databricks Free Tier"
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      timeout_seconds: 7200
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: "data_ingestion_setup"
+          description: "Ingest policy documents, set up Unity Catalog infrastructure, and chunk documents for RAG"
+          timeout_seconds: 1800
+
+          notebook_task:
+            notebook_path: "./notebooks/01_data_ingestion_setup.py"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+
+        - task_key: "embedding_vector_index"
+          description: "Generate embeddings using open-source sentence-transformers and build vector index"
+          timeout_seconds: 3600
+          depends_on:
+            - task_key: "data_ingestion_setup"
+
+          notebook_task:
+            notebook_path: "./notebooks/02_embedding_vector_index.py"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+
+        - task_key: "rag_qa_evaluation"
+          description: "Run RAG-based Q&A with open-source LLM, evaluate responses, and generate insights dashboard"
+          timeout_seconds: 3600
+          depends_on:
+            - task_key: "embedding_vector_index"
+
+          notebook_task:
+            notebook_path: "./notebooks/03_rag_qa_evaluation.py"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/llm-policy-qa-dev
+    variables:
+      catalog_name: "dev_policy_qa"
+
+  staging:
+    mode: development
+    workspace:
+      root_path: /Workspace/Shared/llm-policy-qa-staging
+    variables:
+      catalog_name: "staging_policy_qa"
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/llm-policy-qa-prod
+    variables:
+      catalog_name: "prod_policy_qa"
+    run_as:
+      service_principal_name: ${var.service_principal_name}
