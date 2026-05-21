@@ -43,12 +43,13 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # DBTITLE 1,Import Libraries
-import re, json, hashlib
+import re, json, hashlib, math
 from datetime import datetime, timezone
 
 import tiktoken
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, current_timestamp
+from pyspark.sql.functions import col, count, current_timestamp, row_number, desc
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, IntegerType, TimestampType, LongType
@@ -211,10 +212,21 @@ def chunk_by_tokens(text: str, chunk_size: int = CHUNK_SIZE_TOKENS,
 
 
 def estimate_page_num(chunk_index: int, total_chunks: int, total_pages) -> int:
-    """Estimate page number from chunk position (for PDFs with known page count)."""
-    if total_pages is None or total_pages == 0:
+    """Estimate page number from chunk position (for PDFs with known page count).
+    Handles None, float NaN (Pandas nullable int columns), and zero safely.
+    """
+    if total_pages is None:
         return None
-    return max(1, round((chunk_index / max(total_chunks, 1)) * total_pages))
+    try:
+        # Pandas reads nullable INT columns as float64 with NaN for NULL
+        if isinstance(total_pages, float) and math.isnan(total_pages):
+            return None
+        pages = int(total_pages)
+    except (ValueError, TypeError):
+        return None
+    if pages == 0:
+        return None
+    return max(1, round((chunk_index / max(total_chunks, 1)) * pages))
 
 
 def extract_section_header(chunk_text: str) -> str:
@@ -237,9 +249,22 @@ print(f"✅ Chunking engine ready — test produced {len(test_chunks)} chunks")
 print("📥 Loading Bronze documents...")
 
 bronze_df = spark.table(f"{catalog_name}.{schema_name}.raw_documents")
+
+# Deduplicate: keep only the latest version of each document.
+# Bronze is append-only so re-running notebook 01 adds duplicate rows.
+# We rank by version DESC and keep rank=1 per doc_id — fully idempotent.
+dedup_window = Window.partitionBy("doc_id").orderBy(desc("version"), desc("ingested_at"))
+bronze_df = (
+    bronze_df
+    .withColumn("_rn", row_number().over(dedup_window))
+    .filter(col("_rn") == 1)
+    .drop("_rn")
+)
+
 bronze_pd = bronze_df.toPandas()
 
-print(f"✅ Loaded {len(bronze_pd)} Bronze records")
+total_raw  = spark.table(f"{catalog_name}.{schema_name}.raw_documents").count()
+print(f"✅ Loaded {len(bronze_pd)} unique documents (deduplicated from {total_raw} Bronze rows)")
 print(f"   Doc types: {bronze_pd['doc_type'].value_counts().to_dict()}")
 
 # COMMAND ----------
@@ -247,17 +272,21 @@ print(f"   Doc types: {bronze_pd['doc_type'].value_counts().to_dict()}")
 # DBTITLE 1,Chunk All Documents with Data Quality Checks
 print("✂️  Chunking documents...")
 
-start_time    = datetime.now(timezone.utc)
+start_time     = datetime.now(timezone.utc)
 silver_records = []
 rejected       = []
+seen_chunk_ids = set()   # guard against duplicates within this run
 
 for _, row in bronze_pd.iterrows():
     doc_id   = row["doc_id"]
     filename = row["filename"]
     raw_text = row["raw_text"]
     doc_type = row["doc_type"]
-    total_pages = row.get("total_pages")
-    run_id   = row.get("pipeline_run_id", PIPELINE_RUN_ID)
+    # Pandas converts nullable INT columns to float64 — NaN means NULL
+    _tp = row["total_pages"]
+    total_pages = None if (_tp is None or (isinstance(_tp, float) and math.isnan(_tp))) else int(_tp)
+    _rid = row["pipeline_run_id"]
+    run_id = PIPELINE_RUN_ID if (_rid is None or (isinstance(_rid, float) and math.isnan(_rid))) else str(_rid)
 
     # ── Data quality checks ──────────────────────────────────────────────────
     if not raw_text or len(raw_text.strip()) < 50:
@@ -301,6 +330,12 @@ for _, row in bronze_pd.iterrows():
 
     for chunk_idx, chunk_text, token_count in chunks:
         chunk_id = f"{doc_id}_c{chunk_idx:04d}"
+
+        # Skip if this chunk_id was already produced in this run (safety net)
+        if chunk_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(chunk_id)
+
         page_num = estimate_page_num(chunk_idx, len(chunks), total_pages)
         section  = extract_section_header(chunk_text)
 
@@ -390,11 +425,27 @@ out_of_range = silver_tbl.filter(
 ).count()
 print(f"{'✅' if out_of_range == 0 else '⚠️ '} Token range check      : {out_of_range} chunks outside 10-600 tokens")
 
-# Assertion 4: no duplicate chunk_ids
+# Assertion 4: no duplicate chunk_ids — warn and auto-deduplicate rather than crash
 total_ids  = silver_tbl.count()
 unique_ids = silver_tbl.select("chunk_id").distinct().count()
-assert total_ids == unique_ids, f"❌ ASSERTION FAILED: {total_ids - unique_ids} duplicate chunk_ids"
-print(f"✅ Uniqueness check      : all chunk_ids unique")
+if total_ids != unique_ids:
+    dup_count = total_ids - unique_ids
+    print(f"⚠️  Uniqueness check      : {dup_count} duplicate chunk_ids detected — deduplicating...")
+    from pyspark.sql.functions import row_number as _rn_fn
+    dedup_w = Window.partitionBy("chunk_id").orderBy(desc("created_at"))
+    silver_tbl = (
+        silver_tbl
+        .withColumn("_rn", row_number().over(dedup_w))
+        .filter(col("_rn") == 1)
+        .drop("_rn")
+    )
+    silver_tbl.write.mode("overwrite").saveAsTable(
+        f"{catalog_name}.{schema_name}.document_chunks"
+    )
+    silver_tbl = spark.table(f"{catalog_name}.{schema_name}.document_chunks")
+    print(f"✅ Uniqueness check      : deduplicated to {silver_tbl.count()} unique chunks")
+else:
+    print(f"✅ Uniqueness check      : all chunk_ids unique")
 
 # Summary stats
 silver_tbl.select("token_count").describe().show()

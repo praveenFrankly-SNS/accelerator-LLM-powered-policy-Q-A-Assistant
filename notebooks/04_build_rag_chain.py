@@ -33,7 +33,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Libraries
-# MAGIC %pip install databricks-vectorsearch>=0.22 langchain>=0.2.0 langchain-community>=0.2.0 langchain-databricks>=0.1.0 mlflow>=2.14.0 tiktoken>=0.5.1
+# MAGIC %pip install databricks-vectorsearch==0.40 langchain==0.3.30 langchain-community==0.3.31 langchain-databricks==0.1.2 mlflow==2.22.5 tiktoken==0.13.0
 
 # COMMAND ----------
 
@@ -257,10 +257,12 @@ from databricks.vector_search.client import VectorSearchClient
 vsc = VectorSearchClient(disable_notice=True)
 
 retriever = DatabricksVectorSearch(
-    index          = vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME),
-    text_column    = "chunk_text",
-    columns        = ["chunk_id", "chunk_text", "metadata_json"],
-).as_retriever(search_kwargs={"k": TOP_K})
+    endpoint   = VS_ENDPOINT_NAME,
+    index_name = VS_INDEX_NAME,
+).as_retriever(search_kwargs={
+    "k":       TOP_K,
+    "columns": ["chunk_id", "chunk_text", "metadata_json"],
+})
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a precise policy assistant for an enterprise organization.
@@ -507,39 +509,183 @@ with mlflow.start_run(run_name="04_rag_chain_evaluation") as run:
 # DBTITLE 1,Log and Register RAG Chain in UC Model Registry
 print(f"📦 Registering RAG chain in Unity Catalog: {MODEL_NAME}")
 
+import os
+import mlflow
+from mlflow.models.signature import ModelSignature
+from mlflow.types.schema import Schema, ColSpec
+
+# ── Why pyfunc, not mlflow.langchain.log_model? ───────────────────────────────
+# DatabricksVectorSearch holds a live gRPC connection that cannot be pickled.
+# mlflow.langchain.log_model tries to serialize the full chain object to disk
+# and raises "does not support saving". The correct pattern for Databricks-hosted
+# Vector Search is mlflow.pyfunc with a wrapper class that reconstructs the
+# chain at load/serve time using stored config — no live objects serialized.
+
+class PolicyQAChain(mlflow.pyfunc.PythonModel):
+    """
+    MLflow pyfunc wrapper for the Policy Q&A RAG chain.
+    Reconstructs the full LangChain chain at load time so no live
+    connection objects are serialized to the artifact store.
+    """
+
+    def load_context(self, context):
+        """Called once when the model is loaded for serving."""
+        import json, re
+        from langchain_databricks import ChatDatabricks, DatabricksVectorSearch
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import StrOutputParser
+        from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+
+        # Read config saved alongside the model artifact
+        cfg_path = context.artifacts.get("chain_config")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+        vs_endpoint = cfg["vs_endpoint_name"]
+        vs_index    = cfg["vs_index_name"]
+        llm_model   = cfg["llm_model"]
+        top_k       = cfg["top_k"]
+
+        # Rebuild retriever
+        retriever = DatabricksVectorSearch(
+            endpoint   = vs_endpoint,
+            index_name = vs_index,
+        ).as_retriever(search_kwargs={
+            "k":       top_k,
+            "columns": ["chunk_id", "chunk_text", "metadata_json"],
+        })
+
+        # Rebuild prompt
+        system_prompt = cfg["system_prompt"]
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human",  "{question}"),
+        ])
+
+        # Rebuild LLM
+        llm = ChatDatabricks(endpoint=llm_model, max_tokens=512, temperature=0.0)
+
+        # Context formatter
+        def format_docs(docs):
+            formatted = []
+            for doc in docs:
+                meta = {}
+                try:
+                    meta = json.loads(doc.metadata.get("metadata_json", "{}"))
+                except Exception:
+                    pass
+                filename = meta.get("filename", "unknown")
+                section  = meta.get("section_header", "N/A")
+                page     = doc.metadata.get("page_num", "N/A")
+                formatted.append(
+                    f"[Source: {filename} | Page: {page} | Section: {section}]\n{doc.page_content}"
+                )
+            return "\n\n---\n\n".join(formatted)
+
+        self.chain = (
+            {
+                "context":  retriever | RunnableLambda(format_docs),
+                "question": RunnablePassthrough(),
+            }
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+    def predict(self, context, model_input):
+        """
+        Accept either:
+          - pandas DataFrame with a 'query' column  (Model Serving default)
+          - dict with key 'query'
+          - plain string
+        Returns a list of response strings.
+        """
+        import pandas as pd
+
+        if isinstance(model_input, pd.DataFrame):
+            queries = model_input["query"].tolist()
+        elif isinstance(model_input, dict):
+            q = model_input.get("query") or model_input.get("question", "")
+            queries = [q] if isinstance(q, str) else q
+        elif isinstance(model_input, str):
+            queries = [model_input]
+        else:
+            queries = list(model_input)
+
+        return [self.chain.invoke(q) for q in queries]
+
+
+# ── Save chain config as a JSON artifact (no live objects) ───────────────────
+import json, os
+
+cfg = {
+    "vs_endpoint_name": VS_ENDPOINT_NAME,
+    "vs_index_name":    VS_INDEX_NAME,
+    "llm_model":        LLM_MODEL,
+    "top_k":            TOP_K,
+    "system_prompt":    SYSTEM_PROMPT,
+}
+os.makedirs("/tmp/policy_qa_artifacts", exist_ok=True)
+cfg_path = "/tmp/policy_qa_artifacts/chain_config.json"
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+
+# ── Model signature ───────────────────────────────────────────────────────────
+input_schema  = Schema([ColSpec("string", "query")])
+output_schema = Schema([ColSpec("string", "response")])
+signature     = ModelSignature(inputs=input_schema, outputs=output_schema)
+
+# ── Register via pyfunc ───────────────────────────────────────────────────────
 mlflow.set_registry_uri("databricks-uc")
 
+# Declare Databricks resource dependencies so the serving container gets
+# credentials injected automatically. Required for any pyfunc that calls
+# Vector Search or Foundation Models API at load/predict time (MLflow 2.22+).
+from mlflow.models.resources import (
+    DatabricksVectorSearchIndex,
+    DatabricksServingEndpoint,
+)
+
+resources = [
+    DatabricksVectorSearchIndex(index_name=VS_INDEX_NAME),
+    DatabricksServingEndpoint(endpoint_name=LLM_MODEL),
+]
+
 with mlflow.start_run(run_name="04_rag_chain_registration") as reg_run:
-    mlflow.langchain.autolog(log_traces=True)
-
-    # Define model signature
-    from mlflow.models.signature import ModelSignature
-    from mlflow.types.schema import Schema, ColSpec
-
-    input_schema  = Schema([ColSpec("string", "query")])
-    output_schema = Schema([ColSpec("string", "response")])
-    signature     = ModelSignature(inputs=input_schema, outputs=output_schema)
-
-    model_info = mlflow.langchain.log_model(
-        lc_model   = rag_chain,
-        artifact_path = "rag_chain",
-        signature  = signature,
+    model_info = mlflow.pyfunc.log_model(
+        artifact_path         = "rag_chain",
+        python_model          = PolicyQAChain(),
+        artifacts             = {"chain_config": cfg_path},
+        signature             = signature,
         registered_model_name = MODEL_NAME,
-        input_example = {"query": "How many days of annual leave do I get?"},
+        input_example         = {"query": "How many days of annual leave do I get?"},
+        resources             = resources,   # ← injects credentials into serving container
+        # Versions matched to the workspace runtime (DBR 15.x / Python 3.11).
+        pip_requirements      = [
+            "mlflow==2.22.5",
+            "langchain==0.3.30",
+            "langchain-core==0.3.86",
+            "langchain-community==0.3.31",
+            "langchain-databricks==0.1.2",
+            "databricks-vectorsearch==0.40",
+            "databricks-sdk==0.40.0",
+            "tiktoken==0.13.0",
+            "cloudpickle>=2.0.0",
+        ],
     )
-
     mlflow.set_tags({
-        "accelerator":      "policy_qa_assistant",
-        "model_type":       "rag_chain",
-        "llm_model":        LLM_MODEL,
-        "vs_index":         VS_INDEX_NAME,
-        "pipeline_version": "1.0.0",
-        "source_system":    "unity_catalog_silver",
+        "accelerator":         "policy_qa_assistant",
+        "model_type":          "rag_chain_pyfunc",
+        "llm_model":           LLM_MODEL,
+        "vs_index":            VS_INDEX_NAME,
+        "pipeline_version":    "1.0.0",
+        "source_system":       "unity_catalog_silver",
         "data_classification": "INTERNAL",
     })
 
 print(f"✅ Model registered: {MODEL_NAME}")
-print(f"   Model URI: {model_info.model_uri}")
+print(f"   Model URI : {model_info.model_uri}")
+print(f"   Run ID    : {reg_run.info.run_id}")
 
 # COMMAND ----------
 

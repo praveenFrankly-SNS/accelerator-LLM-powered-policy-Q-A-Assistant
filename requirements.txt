@@ -1,22 +1,25 @@
+# ── Versions matched to workspace runtime (DBR 15.x / Python 3.11) ───────────
+# These are the exact versions confirmed running in the Databricks environment.
+
 # ── Core LLM / RAG stack ──────────────────────────────────────────────────────
-langchain==0.2.16
-langchain-community==0.2.16
-langchain-databricks==0.1.1
-langchain-core==0.2.38
+langchain==0.3.30
+langchain-community==0.3.31
+langchain-databricks==0.1.2
+langchain-core==0.3.86
 
 # ── Databricks SDK & Vector Search ───────────────────────────────────────────
-databricks-sdk==0.28.0
-databricks-vectorsearch==0.22
+databricks-sdk==0.40.0
+databricks-vectorsearch==0.40
 
 # ── Document parsing ──────────────────────────────────────────────────────────
 pypdf==3.17.4
 python-docx==1.1.2
 
 # ── Tokenization ─────────────────────────────────────────────────────────────
-tiktoken==0.7.0
+tiktoken==0.13.0
 
 # ── MLflow ────────────────────────────────────────────────────────────────────
-mlflow==2.14.3
+mlflow==2.22.5
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 gradio==4.36.1
@@ -30,6 +33,7 @@ pyarrow==16.1.0
 requests==2.32.3
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
+cloudpickle>=2.0.0
 python-dateutil==2.9.0
 pytz==2024.1
 

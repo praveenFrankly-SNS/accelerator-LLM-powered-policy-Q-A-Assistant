@@ -32,7 +32,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Libraries
-# MAGIC %pip install gradio>=4.26.0 databricks-sdk>=0.24.0 mlflow>=2.14.0 requests>=2.31.0
+# MAGIC %pip install "gradio>=3.50.0,<4.0.0" "databricks-sdk==0.40.0" "mlflow==2.22.5" "requests==2.32.3"
 
 # COMMAND ----------
 
@@ -45,8 +45,12 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # DBTITLE 1,Import Libraries
-import json, time, uuid, requests
+import json, time, uuid, requests, os
 from datetime import datetime, timezone
+
+# Set proxy exclusion for localhost to prevent Gradio launch connection errors on Databricks
+os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
 
 import mlflow
 from databricks.sdk import WorkspaceClient
@@ -82,6 +86,9 @@ MODEL_NAME           = f"{catalog_name}.{schema_name}.policy_qa_rag_chain"
 SERVING_ENDPOINT     = "policy_qa_endpoint"
 PIPELINE_RUN_ID      = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
 
+spark = SparkSession.builder.getOrCreate()
+w     = WorkspaceClient()
+
 # Databricks workspace URL (for REST API calls from Gradio)
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl", "")
 DB_TOKEN      = dbutils.secrets.get(scope="policy_qa_scope", key="db_token")
@@ -92,9 +99,6 @@ print(f"   Schema           : {schema_name}")
 print(f"   Model            : {MODEL_NAME}")
 print(f"   Serving endpoint : {SERVING_ENDPOINT}")
 print(f"   Workspace URL    : {WORKSPACE_URL}")
-
-spark = SparkSession.builder.getOrCreate()
-w     = WorkspaceClient()
 
 # COMMAND ----------
 
@@ -120,46 +124,99 @@ print(f"✅ Latest model version: {model_version}")
 # COMMAND ----------
 
 # DBTITLE 1,Create or Update Serving Endpoint
-def wait_for_endpoint_ready(client: WorkspaceClient, endpoint_name: str, timeout_min: int = 20):
-    """Poll until serving endpoint is ready."""
+def wait_for_endpoint_ready(client: WorkspaceClient, endpoint_name: str, timeout_min: int = 25):
+    """
+    Poll until serving endpoint is READY or fails definitively.
+    Surfaces the actual deployment_state_message on failure so you can
+    diagnose model load errors without digging through the SDK object dump.
+    """
     deadline = time.time() + timeout_min * 60
     while time.time() < deadline:
-        ep    = client.serving_endpoints.get(endpoint_name)
-        state = ep.state.config_update.value if ep.state else "UNKNOWN"
-        ready = ep.state.ready.value if ep.state else "NOT_READY"
+        ep     = client.serving_endpoints.get(endpoint_name)
+        state  = ep.state.config_update.value  if ep.state else "UNKNOWN"
+        ready  = ep.state.ready.value          if ep.state else "NOT_READY"
         print(f"   State: {state} | Ready: {ready}")
+
         if ready == "READY":
             return True
-        if state in ("UPDATE_FAILED",):
-            raise RuntimeError(f"Endpoint update failed: {ep}")
+
+        # Dig out the human-readable deployment message from served entities
+        if state in ("UPDATE_FAILED", "UPDATE_CANCELED"):
+            msg = "Model server failed to load — check serving logs."
+            try:
+                pending = ep.pending_config or ep.config
+                if pending and pending.served_entities:
+                    for entity in pending.served_entities:
+                        s = entity.state
+                        if s and s.deployment_state_message:
+                            msg = s.deployment_state_message
+                            break
+                elif pending and pending.served_models:
+                    for model in pending.served_models:
+                        s = model.state
+                        if s and s.deployment_state_message:
+                            msg = s.deployment_state_message
+                            break
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Endpoint '{endpoint_name}' deployment failed.\n"
+                f"Reason: {msg}\n\n"
+                f"To diagnose: Databricks UI → Serving → {endpoint_name} → Logs tab.\n"
+                f"Common causes:\n"
+                f"  1. pip install failed — check requirements in notebook 04\n"
+                f"  2. load_context() raised an exception — check chain_config.json artifact\n"
+                f"  3. Vector Search endpoint not reachable from serving container"
+            )
+
         time.sleep(30)
+
     raise TimeoutError(f"Endpoint {endpoint_name} not ready within {timeout_min} min")
 
 
 served_model = ServedModelInput(
-    model_name          = MODEL_NAME,
-    model_version       = model_version,
-    workload_size       = ServedModelInputWorkloadSize.SMALL,
+    model_name            = MODEL_NAME,
+    model_version         = model_version,
+    workload_size         = ServedModelInputWorkloadSize.SMALL,
     scale_to_zero_enabled = True,   # serverless — free when idle
 )
 
 config = EndpointCoreConfigInput(served_models=[served_model])
 
+def _endpoint_is_failed(client: WorkspaceClient, endpoint_name: str) -> bool:
+    """Return True if the endpoint exists but is in a FAILED/NOT_READY state."""
+    try:
+        ep    = client.serving_endpoints.get(endpoint_name)
+        state = ep.state.config_update.value if ep.state else ""
+        ready = ep.state.ready.value         if ep.state else ""
+        return state in ("UPDATE_FAILED", "UPDATE_CANCELED") or ready == "NOT_READY"
+    except Exception:
+        return False
+
 try:
     existing = w.serving_endpoints.get(SERVING_ENDPOINT)
-    print(f"🔄 Updating existing endpoint: {SERVING_ENDPOINT}")
-    w.serving_endpoints.update_config(SERVING_ENDPOINT, served_models=[served_model])
+    existing_state = existing.state.config_update.value if existing.state else ""
+
+    if existing_state in ("UPDATE_FAILED", "UPDATE_CANCELED"):
+        # Previous deployment failed — delete and recreate for a clean slate
+        print(f"⚠️  Endpoint {SERVING_ENDPOINT} is in {existing_state} state.")
+        print(f"   Deleting and recreating for a clean deployment...")
+        w.serving_endpoints.delete(SERVING_ENDPOINT)
+        time.sleep(10)   # brief pause for deletion to propagate
+        print(f"🏗️  Creating fresh endpoint: {SERVING_ENDPOINT}")
+        w.serving_endpoints.create(name=SERVING_ENDPOINT, config=config)
+    else:
+        print(f"🔄 Updating existing endpoint: {SERVING_ENDPOINT}")
+        w.serving_endpoints.update_config(SERVING_ENDPOINT, served_models=[served_model])
+
 except Exception as e:
     if "does not exist" in str(e).lower() or "RESOURCE_DOES_NOT_EXIST" in str(e):
         print(f"🏗️  Creating new serving endpoint: {SERVING_ENDPOINT}")
-        w.serving_endpoints.create(
-            name   = SERVING_ENDPOINT,
-            config = config,
-        )
+        w.serving_endpoints.create(name=SERVING_ENDPOINT, config=config)
     else:
         raise
 
-print("⏳ Waiting for endpoint to be ready...")
+print("⏳ Waiting for endpoint to be ready (may take 10–15 min on first deploy)...")
 wait_for_endpoint_ready(w, SERVING_ENDPOINT)
 print(f"✅ Serving endpoint {SERVING_ENDPOINT} is READY")
 
@@ -347,7 +404,6 @@ EXAMPLE_QUESTIONS = [
 
 with gr.Blocks(
     title="Policy Q&A Assistant — SNS Square",
-    theme=gr.themes.Soft(primary_hue="blue"),
     css="""
         .header-box { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
                       padding: 20px; border-radius: 10px; margin-bottom: 20px; }
@@ -376,8 +432,6 @@ with gr.Blocks(
             chatbot = gr.Chatbot(
                 label="Policy Assistant",
                 height=500,
-                show_copy_button=True,
-                bubble_full_width=False,
             )
             with gr.Row():
                 msg_box = gr.Textbox(
@@ -446,11 +500,66 @@ print("🚀 Launching Gradio UI on Databricks Apps...")
 print("   ⏳ First query may take ~10 seconds (serverless cold start)")
 print()
 
-demo.launch(
-    server_name = "0.0.0.0",
-    server_port = 8080,
-    share       = False,   # Databricks Apps provides the public URL
-)
+# Ensure proxy exclusion for localhost/127.0.0.1 is active in this execution context
+import os
+import requests
+
+# Save current proxy settings
+proxies = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+saved_proxies = {p: os.environ.get(p) for p in proxies}
+
+# Temporarily clear proxy settings during launch to prevent local health check interception
+for p in proxies:
+    if p in os.environ:
+        del os.environ[p]
+
+os.environ["no_proxy"] = "*"
+os.environ["NO_PROXY"] = "*"
+
+try:
+    gr.close_all()
+except Exception as e:
+    print(f"⚠️ Warning: Could not close previous Gradio instances: {e}")
+
+# Determine server port: use DATABRICKS_APP_PORT if running inside Databricks Apps,
+# otherwise find a free port starting from 8080 for interactive/notebook execution.
+if "DATABRICKS_APP_PORT" in os.environ:
+    server_port = int(os.environ["DATABRICKS_APP_PORT"])
+    server_name = "0.0.0.0"
+    share_gradio = False
+    print(f"👉 Using Databricks Apps port: {server_port}")
+else:
+    server_name = "127.0.0.1"
+    share_gradio = True
+    import socket
+    def find_free_port(start_port=8080):
+        port = start_port
+        while port < 8100:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("0.0.0.0", port))
+                    return port
+                except OSError:
+                    port += 1
+        return start_port
+    server_port = find_free_port(8080)
+    print(f"👉 Using free port: {server_port} with share=True")
+
+try:
+    demo.launch(
+        server_name = server_name,
+        server_port = server_port,
+        share       = share_gradio,
+        inline      = True,
+        show_error  = True
+    )
+finally:
+    # Restore proxy settings for subsequent network requests (e.g. Model Serving calls)
+    for p, val in saved_proxies.items():
+        if val is not None:
+            os.environ[p] = val
+        elif p in os.environ:
+            del os.environ[p]
 
 # COMMAND ----------
 

@@ -30,9 +30,20 @@ def split_into_sentences(text: str) -> list:
     return sentences
 
 
-def extract_section_header(chunk_text: str) -> str:
-    match = re.search(r'^(\d+[\.\d]*\s+[A-Z][A-Z\s]+)', chunk_text, re.MULTILINE)
-    return match.group(1).strip() if match else None
+def estimate_page_num(chunk_index: int, total_chunks: int, total_pages) -> int:
+    """Mirrors the fixed notebook function."""
+    import math
+    if total_pages is None:
+        return None
+    try:
+        if isinstance(total_pages, float) and math.isnan(total_pages):
+            return None
+        pages = int(total_pages)
+    except (ValueError, TypeError):
+        return None
+    if pages == 0:
+        return None
+    return max(1, round((chunk_index / max(total_chunks, 1)) * pages))
 
 
 # ── Guardrail functions (mirrors notebooks/04_build_rag_chain.py) ─────────────
@@ -50,6 +61,11 @@ INJECTION_PATTERNS = [
 ]
 
 MAX_INPUT_TOKENS = 2000
+
+
+def extract_section_header(chunk_text: str) -> str:
+    match = re.search(r'^(\d+[\.\d]*\s+[A-Z][A-Z\s]+)', chunk_text, re.MULTILINE)
+    return match.group(1).strip() if match else None
 
 
 def check_input_guardrails(query: str) -> dict:
@@ -78,6 +94,41 @@ def check_input_guardrails(query: str) -> dict:
         "sanitized_query": sanitized,
         "pii_detected":    len(pii_found) > 0,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: estimate_page_num  ← regression tests for the NaN bug
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEstimatePageNum:
+
+    def test_none_returns_none(self):
+        assert estimate_page_num(0, 10, None) is None
+
+    def test_float_nan_returns_none(self):
+        """Core regression: Pandas NaN must not crash with ValueError."""
+        assert estimate_page_num(0, 10, float('nan')) is None
+
+    def test_zero_pages_returns_none(self):
+        assert estimate_page_num(0, 10, 0) is None
+
+    def test_normal_pdf_first_chunk(self):
+        result = estimate_page_num(0, 10, 5)
+        assert result == 1
+
+    def test_normal_pdf_last_chunk(self):
+        result = estimate_page_num(9, 10, 10)
+        assert result is not None
+        assert result >= 1
+
+    def test_float_pages_converted(self):
+        # Pandas may give 5.0 instead of 5 for integer columns
+        result = estimate_page_num(0, 10, 5.0)
+        assert result == 1
+
+    def test_single_chunk_single_page(self):
+        result = estimate_page_num(0, 1, 1)
+        assert result == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
