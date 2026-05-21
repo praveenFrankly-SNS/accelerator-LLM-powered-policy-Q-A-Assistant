@@ -1,32 +1,42 @@
-# Core NLP / LLM libraries
-sentence-transformers>=2.2.2
-transformers>=4.35.0
-torch>=2.0.0                  # CPU-only build is fine for free tier
+# ── Core LLM / RAG stack ──────────────────────────────────────────────────────
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-databricks==0.1.1
+langchain-core==0.2.38
 
-# Document parsing (for real PDF ingestion)
-pypdf>=3.17.0
-langchain>=0.1.0
-langchain-community>=0.0.10
-tiktoken>=0.5.1
+# ── Databricks SDK & Vector Search ───────────────────────────────────────────
+databricks-sdk==0.28.0
+databricks-vectorsearch==0.22
 
-# Data processing
-pandas>=2.0.0
-numpy>=1.24.0
-pyspark>=3.4.0
+# ── Document parsing ──────────────────────────────────────────────────────────
+pypdf==3.17.4
+python-docx==1.1.2
 
-# Visualisation
-plotly>=5.17.0
-matplotlib>=3.6.0
+# ── Tokenization ─────────────────────────────────────────────────────────────
+tiktoken==0.7.0
 
-# Utilities
-python-dateutil>=2.8.0
-pytz>=2023.3
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlflow==2.14.3
 
-# MLOps
-mlflow>=2.7.0
+# ── UI ────────────────────────────────────────────────────────────────────────
+gradio==4.36.1
 
-# Development and testing
-pytest>=7.4.0
-pytest-cov>=4.1.0
-black>=23.7.0
-flake8>=6.0.0
+# ── Data processing ───────────────────────────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==16.1.0
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+requests==2.32.3
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil==2.9.0
+pytz==2024.1
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.2.2
+pytest-cov==5.0.0
+
+# ── Code quality ─────────────────────────────────────────────────────────────
+black==24.4.2
+flake8==7.0.0

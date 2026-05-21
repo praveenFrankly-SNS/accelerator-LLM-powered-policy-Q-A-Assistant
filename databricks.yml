@@ -14,58 +14,224 @@ variables:
     description: "Deployment environment (dev, staging, prod)"
     default: "dev"
 
+  llm_model:
+    description: "LLM model endpoint (8B for dev, 70B for final demo)"
+    default: "databricks-meta-llama-3-1-8b-instruct"
+
+  vs_endpoint_name:
+    description: "Mosaic AI Vector Search endpoint name"
+    default: "policy_qa_vs_endpoint"
+
   service_principal_name:
-    description: "Service principal for production deployment"
+    description: "Service principal for production deployment (leave blank for dev)"
     default: ""
 
+# ── Resources ──────────────────────────────────────────────────────────────────
 resources:
+
+  # ── Main pipeline job ────────────────────────────────────────────────────────
   jobs:
-    policy_qa_workflow:
-      name: "LLM-Powered Policy Q&A Assistant Pipeline"
-      description: "End-to-end RAG pipeline for policy document ingestion, embedding, vector indexing, and Q&A using open-source LLMs on Databricks Free Tier"
+    policy_qa_pipeline:
+      name: "[Policy Q&A] Full Pipeline — Ingest → Chunk → Embed → RAG → Serve"
+      description: >
+        End-to-end RAG pipeline: Bronze ingestion → Silver chunking →
+        Vector Search indexing → RAG chain evaluation → Model Serving + Gradio UI.
+        Accelerator: LLM-Powered Policy Q&A Assistant v1.0.0 | SNS Square
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+        on_duration_warning_threshold_exceeded:
+          - ${workspace.current_user.userName}
+
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 7200   # alert if pipeline takes > 2 hours
+
+      timeout_seconds: 10800
+      max_concurrent_runs: 1
+
+      tasks:
+        # ── Task 1: Bronze Ingestion ─────────────────────────────────────────
+        - task_key: "01_ingest_documents"
+          description: "Load PDFs/DOCX/TXT from UC Volume → Bronze Delta table"
+          timeout_seconds: 1800
+          retry_on_timeout: true
+          max_retries: 2
+          min_retry_interval_millis: 60000
+
+          job_cluster_key: "pipeline_cluster"
+
+          notebook_task:
+            notebook_path: "./notebooks/01_ingest_documents"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name:  ${var.schema_name}
+
+        # ── Task 2: Silver Chunking ──────────────────────────────────────────
+        - task_key: "02_chunk_and_process"
+          description: "Token-aware chunking + data quality → Silver Delta table"
+          timeout_seconds: 1800
+          retry_on_timeout: true
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          depends_on:
+            - task_key: "01_ingest_documents"
+
+          job_cluster_key: "pipeline_cluster"
+
+          notebook_task:
+            notebook_path: "./notebooks/02_chunk_and_process"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name:  ${var.schema_name}
+
+        # ── Task 3: Embed & Vector Search ────────────────────────────────────
+        - task_key: "03_embed_and_index"
+          description: "BGE-Large embeddings → Mosaic AI Vector Search index"
+          timeout_seconds: 3600
+          retry_on_timeout: true
+          max_retries: 1
+          min_retry_interval_millis: 120000
+          depends_on:
+            - task_key: "02_chunk_and_process"
+
+          job_cluster_key: "pipeline_cluster"
+
+          notebook_task:
+            notebook_path: "./notebooks/03_embed_and_index"
+            base_parameters:
+              catalog_name:     ${var.catalog_name}
+              schema_name:      ${var.schema_name}
+              vs_endpoint_name: ${var.vs_endpoint_name}
+              use_fm_api:       "true"
+
+        # ── Task 4: RAG Chain + Evaluation ───────────────────────────────────
+        - task_key: "04_build_rag_chain"
+          description: "LangChain RAG chain + 20-question evaluation + UC model registration"
+          timeout_seconds: 3600
+          retry_on_timeout: false
+          max_retries: 1
+          min_retry_interval_millis: 60000
+          depends_on:
+            - task_key: "03_embed_and_index"
+
+          job_cluster_key: "pipeline_cluster"
+
+          notebook_task:
+            notebook_path: "./notebooks/04_build_rag_chain"
+            base_parameters:
+              catalog_name:     ${var.catalog_name}
+              schema_name:      ${var.schema_name}
+              llm_model:        ${var.llm_model}
+              vs_endpoint_name: ${var.vs_endpoint_name}
+              use_fm_api:       "true"
+
+        # ── Task 5: Serve + Demo UI ──────────────────────────────────────────
+        - task_key: "05_serve_and_demo"
+          description: "Deploy Model Serving endpoint + launch Gradio UI on Databricks Apps"
+          timeout_seconds: 1800
+          retry_on_timeout: false
+          max_retries: 1
+          min_retry_interval_millis: 60000
+          depends_on:
+            - task_key: "04_build_rag_chain"
+
+          job_cluster_key: "pipeline_cluster"
+
+          notebook_task:
+            notebook_path: "./notebooks/05_serve_and_demo"
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              schema_name:  ${var.schema_name}
+              llm_model:    ${var.llm_model}
+              use_fm_api:   "true"
+
+      # ── Job cluster (job cluster = billed only while running) ──────────────
+      job_clusters:
+        - job_cluster_key: "pipeline_cluster"
+          new_cluster:
+            spark_version: "14.3.x-scala2.12"
+            node_type_id:  "i3.xlarge"
+            num_workers:   2
+            autoscale:
+              min_workers: 1
+              max_workers: 4
+            spark_conf:
+              "spark.databricks.delta.preview.enabled": "true"
+            custom_tags:
+              project_name:        "policy_qa_assistant"
+              accelerator_version: "1.0.0"
+              environment:         ${var.environment}
+
+    # ── Scheduled re-sync job (weekly) ────────────────────────────────────────
+    policy_qa_weekly_sync:
+      name: "[Policy Q&A] Weekly Document Sync"
+      description: >
+        Weekly incremental sync: re-ingest any new/updated policy documents,
+        re-chunk, and re-sync the Vector Search index.
+
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"   # 2 AM UTC every day
+        timezone_id: "UTC"
+        pause_status: PAUSED   # unpause in production
 
       email_notifications:
         on_failure:
           - ${workspace.current_user.userName}
 
-      timeout_seconds: 7200
+      timeout_seconds: 3600
       max_concurrent_runs: 1
 
       tasks:
-        - task_key: "data_ingestion_setup"
-          description: "Ingest policy documents, set up Unity Catalog infrastructure, and chunk documents for RAG"
-          timeout_seconds: 1800
-
+        - task_key: "sync_ingest"
+          job_cluster_key: "sync_cluster"
           notebook_task:
-            notebook_path: "./notebooks/01_data_ingestion_setup.py"
+            notebook_path: "./notebooks/01_ingest_documents"
             base_parameters:
               catalog_name: ${var.catalog_name}
-              schema_name: ${var.schema_name}
+              schema_name:  ${var.schema_name}
 
-        - task_key: "embedding_vector_index"
-          description: "Generate embeddings using open-source sentence-transformers and build vector index"
-          timeout_seconds: 3600
+        - task_key: "sync_chunk"
           depends_on:
-            - task_key: "data_ingestion_setup"
-
+            - task_key: "sync_ingest"
+          job_cluster_key: "sync_cluster"
           notebook_task:
-            notebook_path: "./notebooks/02_embedding_vector_index.py"
+            notebook_path: "./notebooks/02_chunk_and_process"
             base_parameters:
               catalog_name: ${var.catalog_name}
-              schema_name: ${var.schema_name}
+              schema_name:  ${var.schema_name}
 
-        - task_key: "rag_qa_evaluation"
-          description: "Run RAG-based Q&A with open-source LLM, evaluate responses, and generate insights dashboard"
-          timeout_seconds: 3600
+        - task_key: "sync_index"
           depends_on:
-            - task_key: "embedding_vector_index"
-
+            - task_key: "sync_chunk"
+          job_cluster_key: "sync_cluster"
           notebook_task:
-            notebook_path: "./notebooks/03_rag_qa_evaluation.py"
+            notebook_path: "./notebooks/03_embed_and_index"
             base_parameters:
-              catalog_name: ${var.catalog_name}
-              schema_name: ${var.schema_name}
+              catalog_name:     ${var.catalog_name}
+              schema_name:      ${var.schema_name}
+              vs_endpoint_name: ${var.vs_endpoint_name}
+              use_fm_api:       "true"
 
+      job_clusters:
+        - job_cluster_key: "sync_cluster"
+          new_cluster:
+            spark_version: "14.3.x-scala2.12"
+            node_type_id:  "i3.xlarge"
+            num_workers:   1
+            autoscale:
+              min_workers: 1
+              max_workers: 2
+            custom_tags:
+              project_name:        "policy_qa_assistant"
+              accelerator_version: "1.0.0"
+              environment:         ${var.environment}
+              job_type:            "weekly_sync"
+
+# ── Deployment targets ─────────────────────────────────────────────────────────
 targets:
   dev:
     mode: development
@@ -73,20 +239,26 @@ targets:
     workspace:
       root_path: /Workspace/Users/${workspace.current_user.userName}/llm-policy-qa-dev
     variables:
-      catalog_name: "dev_policy_qa"
+      catalog_name:  "dev_policy_qa"
+      environment:   "dev"
+      llm_model:     "databricks-meta-llama-3-1-8b-instruct"
 
   staging:
     mode: development
     workspace:
       root_path: /Workspace/Shared/llm-policy-qa-staging
     variables:
-      catalog_name: "staging_policy_qa"
+      catalog_name:  "staging_policy_qa"
+      environment:   "staging"
+      llm_model:     "databricks-meta-llama-3-1-8b-instruct"
 
   prod:
     mode: production
     workspace:
       root_path: /Workspace/Shared/llm-policy-qa-prod
     variables:
-      catalog_name: "prod_policy_qa"
+      catalog_name:  "prod_policy_qa"
+      environment:   "prod"
+      llm_model:     "databricks-meta-llama-3-1-70b-instruct"
     run_as:
       service_principal_name: ${var.service_principal_name}
