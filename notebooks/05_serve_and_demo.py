@@ -32,7 +32,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Libraries
-# MAGIC %pip install "gradio>=3.50.0,<4.0.0" "databricks-sdk==0.40.0" "mlflow==2.22.5" "requests==2.32.3"
+# MAGIC %pip install "gradio>=4.0.0" "databricks-sdk==0.40.0" "mlflow==2.22.5" "requests==2.32.3"
 
 # COMMAND ----------
 
@@ -529,21 +529,10 @@ if "DATABRICKS_APP_PORT" in os.environ:
     share_gradio = False
     print(f"👉 Using Databricks Apps port: {server_port}")
 else:
-    server_name = "127.0.0.1"
+    server_name = "0.0.0.0"
+    server_port = None
     share_gradio = True
-    import socket
-    def find_free_port(start_port=8080):
-        port = start_port
-        while port < 8100:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("0.0.0.0", port))
-                    return port
-                except OSError:
-                    port += 1
-        return start_port
-    server_port = find_free_port(8080)
-    print(f"👉 Using free port: {server_port} with share=True")
+    print("👉 Launching interactive Gradio with share=True (Port assigned dynamically)")
 
 try:
     demo.launch(
