@@ -293,6 +293,22 @@ def call_rag_endpoint(query: str) -> tuple:
 
     return "⚠️ Service unavailable after 3 attempts.", 0
 
+def format_response(raw: str, latency_ms: int) -> str:
+    """
+    Wraps the raw LLM answer in a clean, professional layout.
+    """
+    # Strip accidental leading/trailing whitespace from the model
+    answer = raw.strip()
+
+    formatted = (
+        f"**📋 Policy Answer**\n\n"
+        f"{answer}\n\n"
+        f"---\n"
+        f"*⚠️ This response is AI-generated based on available policy documents. "
+        f"For binding decisions, please consult HR or the relevant department directly.*\n\n"
+        f"*🕐 Response time: {latency_ms} ms*"
+    )
+    return formatted
 
 # ── Helper: log interaction to Gold table ─────────────────────────────────────
 def log_interaction(
@@ -370,16 +386,18 @@ def chat(message: str, history: list) -> tuple:
     # Warm-up message for first query
     if not history:
         history = history + [
-            [None, "👋 Welcome to the Policy Q&A Assistant. "
-                   "Ask me anything about company policies. "
-                   "⏳ First query may take ~10 seconds to warm up the endpoint."]
+            {"role": "assistant", "content": "👋 Welcome to the Policy Q&A Assistant. Ask me anything about company policies. ⏳ First query may take ~10 seconds to warm up the endpoint."}
         ]
 
     response, latency_ms = call_rag_endpoint(message)
+    response = format_response(response, latency_ms)
     interaction_id = log_interaction(SESSION_ID, message, response, latency_ms)
     last_interaction_id["value"] = interaction_id
 
-    history = history + [[message, response]]
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": response}
+    ]
     return "", history
 
 
@@ -432,6 +450,7 @@ with gr.Blocks(
             chatbot = gr.Chatbot(
                 label="Policy Assistant",
                 height=500,
+                type="messages",
             )
             with gr.Row():
                 msg_box = gr.Textbox(
